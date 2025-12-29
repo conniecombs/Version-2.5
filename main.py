@@ -25,7 +25,8 @@ from modules.gallery_manager import GalleryManager
 from modules.settings_manager import SettingsManager
 from modules.template_manager import TemplateManager, TemplateEditor
 from modules.upload_manager import UploadManager
-from modules.utils import ContextUtils 
+from modules.utils import ContextUtils
+from modules.path_validator import PathValidator, PathValidationError
 from loguru import logger
 
 # Tkinter can hit the default limit (1000) when rendering thousands of widgets.
@@ -111,9 +112,14 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop_target_register(DND_FILES)
         self.dnd_bind('<<Drop>>', self.drop_files)
         
-        # CLI
-        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-            self.after(500, lambda: self._process_files([sys.argv[1]]))
+        # CLI - Securely validate command line argument
+        if len(sys.argv) > 1:
+            try:
+                validated_path = PathValidator.validate_input_path(sys.argv[1])
+                self.after(500, lambda: self._process_files([str(validated_path)]))
+            except PathValidationError as e:
+                logger.error(f"Invalid CLI argument: {e}")
+                messagebox.showerror("Invalid Path", f"Cannot process path from command line:\n{e}")
         
         self.after(100, self.update_ui_loop)
 
@@ -571,25 +577,45 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _process_files(self, inputs):
         misc_files = []
         folder_jobs = []
-        
+
         # Capture current state of the checkbox safely on the main thread
         show_previews = self.var_show_previews.get()
 
         for path in inputs:
-            if os.path.isdir(path):
-                folder_name = os.path.basename(path.rstrip(os.sep))
-                group_widget = self._create_group(folder_name)
-                files_in_folder = []
-                for root, _, names in os.walk(path):
-                    for n in names:
-                        if n.lower().endswith(config.SUPPORTED_EXTENSIONS):
-                            files_in_folder.append(os.path.join(root, n))
-                if files_in_folder:
-                    folder_jobs.append((group_widget, sorted(files_in_folder, key=config.natural_sort_key)))
-                else:
-                    group_widget.destroy()
-            elif path.lower().endswith(config.SUPPORTED_EXTENSIONS):
-                misc_files.append(path)
+            try:
+                # Validate path first
+                validated_path = PathValidator.validate_input_path(path)
+                path = str(validated_path)
+
+                if validated_path.is_dir():
+                    folder_name = validated_path.name
+                    group_widget = self._create_group(folder_name)
+
+                    # Use secure directory scanning
+                    try:
+                        files_in_folder = PathValidator.scan_directory_for_images(path, recursive=True)
+                        files_in_folder = [str(f) for f in files_in_folder]
+
+                        if files_in_folder:
+                            folder_jobs.append((group_widget, sorted(files_in_folder, key=config.natural_sort_key)))
+                        else:
+                            group_widget.destroy()
+                    except PathValidationError as e:
+                        logger.error(f"Error scanning directory {path}: {e}")
+                        group_widget.destroy()
+
+                elif validated_path.is_file():
+                    # Validate it's an image file
+                    try:
+                        PathValidator.validate_image_file(path)
+                        misc_files.append(path)
+                    except PathValidationError as e:
+                        logger.warning(f"Skipping invalid file {path}: {e}")
+
+            except PathValidationError as e:
+                logger.warning(f"Skipping invalid path {path}: {e}")
+                messagebox.showwarning("Invalid Path", f"Cannot process path:\n{path}\n\n{e}")
+                continue
         
         # --- FIX 3: Submit jobs to ThreadPoolExecutor instead of spawning threads ---
         for grp, f_list in folder_jobs:
@@ -861,20 +887,23 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         # Buffer text first (for final bulk copy)
         if self.var_auto_copy.get():
             self.clipboard_buffer.append(text)
-        
-        safe_title = "".join(c for c in group.title if c.isalnum() or c in (' ', '_', '-')).strip()
+
+        # Use secure filename sanitization
+        safe_title = PathValidator.safe_filename(group.title, max_length=50)
         ts = datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # --- CREATE OUTPUT FOLDER ---
-        output_dir = "Output"
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
-        out_name = os.path.join(output_dir, f"{safe_title}_{ts}.txt")
-        # ----------------------------
-        
+
+        # --- CREATE OUTPUT FOLDER SECURELY ---
         try:
-            with open(out_name, "w", encoding="utf-8") as f: f.write(text)
-            self.current_output_files.append(out_name)
-            self.log(f"Saved: {out_name}")
+            output_filename = f"{safe_title}_{ts}.txt"
+            out_path = PathValidator.validate_output_path(
+                os.path.join("Output", output_filename),
+                create_parent=True
+            )
+            # ----------------------------
+
+            with open(out_path, "w", encoding="utf-8") as f: f.write(text)
+            self.current_output_files.append(str(out_path))
+            self.log(f"Saved: {out_path}")
             
             # --- FIX: Immediate Feedback per Batch ---
             self.lbl_eta.configure(text=f"Saved: {safe_title}_{ts}.txt")
@@ -896,10 +925,14 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
             elif svc == "vipr.im" and self.var_vipr_links.get(): need_links_txt = True
             
             if need_links_txt:
-                links_name = os.path.join(output_dir, f"{safe_title}_{ts}_links.txt")
+                links_filename = f"{safe_title}_{ts}_links.txt"
+                links_path = PathValidator.validate_output_path(
+                    os.path.join("Output", links_filename),
+                    create_parent=True
+                )
                 raw_links = "\n".join([r[0] for r in group_results])
-                with open(links_name, "w", encoding="utf-8") as f: f.write(raw_links)
-                self.log(f"Saved Links: {links_name}")
+                with open(links_path, "w", encoding="utf-8") as f: f.write(raw_links)
+                self.log(f"Saved Links: {links_path}")
                 
         except Exception as e:
             self.log(f"Error writing output for {group.title}: {e}")
