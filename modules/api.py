@@ -16,6 +16,7 @@ import httpx
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from bs4 import BeautifulSoup
 from . import config
+from .error_handler import handle_authentication_error, handle_network_error, ErrorContext, ErrorSeverity, get_error_handler
 from loguru import logger
 
 def create_resilient_client(retries=None):
@@ -59,10 +60,11 @@ def turbo_login(user, password, client: httpx.Client = None):
         if r.status_code in [301, 302] or "logout.tu" in r.text:
             return client.cookies
         else:
-            logger.error("Turbo Login Failed: check credentials.")
+            error = ValueError("Invalid credentials")
+            handle_authentication_error(error, "turboimagehost")
             return None
     except Exception as e:
-        logger.error(f"Turbo Login POST Error: {e}")
+        handle_network_error(e, "Login", "turboimagehost")
         return None
     finally:
         if should_close: client.close()

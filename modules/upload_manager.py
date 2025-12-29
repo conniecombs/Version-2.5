@@ -4,6 +4,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from . import api
 from . import config
+from .error_handler import handle_upload_error, ErrorContext, ErrorSeverity, get_error_handler
 from loguru import logger
 
 # Thread-local storage for HTTP clients (replaces the global one in main.py)
@@ -155,6 +156,11 @@ class UploadManager:
                 
         except Exception as e:
             self.progress_queue.put(('status', fp, 'Failed'))
-            logger.error(f"Err {os.path.basename(fp)}: {e}")
+            # Use centralized error handler
+            handle_upload_error(
+                error=e,
+                file_path=fp,
+                service=cfg.get('service', 'unknown')
+            )
         finally:
             if uploader: uploader.close()
