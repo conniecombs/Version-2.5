@@ -8,3 +8,4 @@ keyring
 loguru
 pyperclip
 pyinstaller
+tenacity
