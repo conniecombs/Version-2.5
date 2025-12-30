@@ -26,6 +26,7 @@ from modules.gallery_manager import GalleryManager
 from modules.settings_manager import SettingsManager
 from modules.template_manager import TemplateManager, TemplateEditor
 from modules.upload_manager import UploadManager
+from modules.async_upload_manager import AsyncUploadManager
 from modules.upload_coordinator import UploadCoordinator, GroupContext
 from modules.utils import ContextUtils
 from modules.path_validator import PathValidator, PathValidationError
@@ -85,8 +86,9 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.state = AppState()
         self.state_mgr = StateManager(self.state)
 
-        # Initialize UploadManager with state queues
-        self.upload_manager = UploadManager(
+        # Initialize AsyncUploadManager with state queues (performance-optimized)
+        # Uses async/await for better concurrency and lower resource usage
+        self.upload_manager = AsyncUploadManager(
             self.state.queues.progress_queue,
             self.state.queues.result_queue,
             self.state.upload.cancel_event
