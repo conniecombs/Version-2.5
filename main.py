@@ -32,6 +32,7 @@ from modules.path_validator import PathValidator, PathValidationError
 from modules.error_handler import get_error_handler, ErrorSeverity
 from modules.app_state import AppState, StateManager
 from modules.config_loader import get_config_loader
+from modules.thumbnail_cache import get_thumbnail_cache
 from loguru import logger
 
 # Load user configuration (YAML-based, optional)
@@ -231,8 +232,11 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
             thread_menu.add_radiobutton(label=f"{i} Threads", value=i, variable=self.menu_thread_var, command=lambda n=i: self.set_global_threads(n))
 
         tools_menu.add_separator()
+        tools_menu.add_command(label="Thumbnail Cache Stats", command=self.show_cache_stats)
+        tools_menu.add_command(label="Clear Thumbnail Cache", command=self.clear_cache)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Install Context Menu", command=ContextUtils.install_menu)
-        
+
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Execution Log", command=self.toggle_log)
@@ -710,25 +714,39 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         return group
 
     def _thumb_worker(self, files, group_widget, show_previews):
+        """Generate thumbnails with caching for performance."""
+        thumb_cache = get_thumbnail_cache()
+
         for f in files:
             if f in self.file_widgets: continue
 
             pil_image = None
             if show_previews:
-                try:
-                    # Use context manager to ensure file is properly closed
-                    with Image.open(f) as img:
-                        img.thumbnail(_app_config.ui.thumbnail_size)
-                        # Create a copy since original will be closed
-                        pil_image = img.copy()
-                except Exception as e:
-                    logger.debug(f"Failed to create thumbnail for {f}: {e}")
-                    pil_image = None
+                # Try cache first (fast path)
+                pil_image = thumb_cache.get(f, _app_config.ui.thumbnail_size)
+
+                if pil_image is None:
+                    # Cache miss - generate thumbnail
+                    try:
+                        # Use context manager to ensure file is properly closed
+                        with Image.open(f) as img:
+                            img.thumbnail(_app_config.ui.thumbnail_size)
+                            # Create a copy since original will be closed
+                            pil_image = img.copy()
+
+                        # Store in cache for future use
+                        if pil_image:
+                            thumb_cache.put(f, pil_image, _app_config.ui.thumbnail_size)
+
+                    except Exception as e:
+                        logger.debug(f"Failed to create thumbnail for {f}: {e}")
+                        pil_image = None
 
             self.ui_queue.put(('add', f, pil_image, group_widget))
 
             # If skipping previews, run much faster (shorter sleep)
-            time.sleep(config.THUMBNAIL_SLEEP_WITH_PREVIEW if show_previews else config.THUMBNAIL_SLEEP_NO_PREVIEW)
+            time.sleep(_app_config.performance.thumbnail_sleep_with_preview if show_previews
+                      else _app_config.performance.thumbnail_sleep_no_preview)
 
     # --- Upload Logic ---
     def start_upload(self):
@@ -967,6 +985,33 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def toggle_log(self):
         if self.log_window_ref and self.log_window_ref.winfo_exists(): self.log_window_ref.lift()
         else: self.log_window_ref = LogWindow(self, self.log_cache)
+
+    def show_cache_stats(self):
+        """Display thumbnail cache statistics."""
+        cache = get_thumbnail_cache()
+        stats = cache.get_stats()
+
+        msg = (
+            f"Thumbnail Cache Performance:\n\n"
+            f"Hit Rate: {stats['hit_rate_percent']}%\n"
+            f"Cache Hits: {stats['hits']}\n"
+            f"Cache Misses: {stats['misses']}\n"
+            f"Total Requests: {stats['total_requests']}\n\n"
+            f"Memory Cache Size: {stats['memory_cache_size']} / {stats['max_memory_items']} items\n\n"
+            f"Higher hit rates mean better performance.\n"
+            f"Cache automatically evicts oldest items when full (LRU)."
+        )
+
+        messagebox.showinfo("Thumbnail Cache Statistics", msg)
+        cache.log_stats()  # Also log to execution log
+
+    def clear_cache(self):
+        """Clear the thumbnail cache."""
+        if messagebox.askyesno("Clear Cache", "Clear all cached thumbnails?\n\nNext time files are added, thumbnails will be regenerated."):
+            from modules.thumbnail_cache import clear_thumbnail_cache
+            clear_thumbnail_cache()
+            messagebox.showinfo("Success", "Thumbnail cache cleared.")
+            logger.info("Thumbnail cache manually cleared by user")
 
     def retry_failed(self):
         cnt = 0
