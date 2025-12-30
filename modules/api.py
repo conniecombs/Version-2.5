@@ -39,6 +39,28 @@ def create_resilient_client(retries=None):
     client.headers.update({'User-Agent': config.USER_AGENT})
     return client
 
+
+def create_async_client(retries=None):
+    """
+    Creates an httpx.AsyncClient for async/await uploads.
+
+    Benefits:
+    - Non-blocking I/O for better concurrency
+    - Lower resource usage than threads
+    - Built-in connection pooling
+    """
+    if retries is None:
+        retries = _app_config.network.retry_count
+    transport = httpx.AsyncHTTPTransport(retries=retries)
+
+    client = httpx.AsyncClient(
+        transport=transport,
+        http2=_app_config.network.http2_enabled,
+        timeout=_app_config.network.timeout_seconds
+    )
+    client.headers.update({'User-Agent': config.USER_AGENT})
+    return client
+
 # --- Turbo Helper Functions ---
 
 def turbo_login(user, password, client: httpx.Client = None):
