@@ -1,0 +1,34 @@
+# Connie's Uploader Ultimate - Configuration File
+# All settings are optional. Remove or comment out to use defaults.
+
+# Network Settings
+network:
+  timeout_seconds: 60.0          # Default timeout for HTTP requests
+  retry_count: 3                  # Number of retries for failed requests
+  upload_timeout_seconds: 300.0   # Extended timeout for large file uploads
+  chunk_size: 8192                # Bytes to read per chunk during upload
+  http2_enabled: true             # Enable HTTP/2 support
+
+# UI Settings
+ui:
+  update_interval_ms: 20          # UI refresh rate (lower = more responsive, higher CPU)
+  thumbnail_size: [40, 40]        # Thumbnail dimensions [width, height]
+  show_previews_default: true     # Show image previews by default
+  recursion_limit: 3000           # Python recursion limit for large file lists
+
+# Threading Configuration
+threading:
+  imx_threads: 5                  # Concurrent uploads for IMX.to
+  pixhost_threads: 3              # Concurrent uploads for Pixhost
+  turbo_threads: 2                # Concurrent uploads for TurboImageHost
+  vipr_threads: 1                 # Concurrent uploads for Vipr (keep at 1)
+  thumbnail_workers: 4            # Parallel thumbnail generation threads
+
+# Performance Tuning
+performance:
+  ui_queue_batch_size: 20         # Max UI updates per cycle
+  progress_queue_batch_size: 50   # Max progress updates per cycle
+  result_queue_batch_size: 10     # Max result processing per cycle
+  thumbnail_sleep_with_preview: 0.01    # Delay between thumbnails (with preview)
+  thumbnail_sleep_no_preview: 0.001     # Delay between thumbnails (no preview)
+  gc_threshold_files: 100         # Trigger garbage collection after N files

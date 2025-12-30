@@ -8,6 +8,7 @@ import threading
 import queue
 import os
 import sys
+import gc
 import keyring
 import pyperclip
 import subprocess
@@ -25,11 +26,22 @@ from modules.gallery_manager import GalleryManager
 from modules.settings_manager import SettingsManager
 from modules.template_manager import TemplateManager, TemplateEditor
 from modules.upload_manager import UploadManager
-from modules.utils import ContextUtils 
+from modules.async_upload_manager import AsyncUploadManager
+from modules.upload_coordinator import UploadCoordinator, GroupContext
+from modules.utils import ContextUtils
+from modules.path_validator import PathValidator, PathValidationError
+from modules.error_handler import get_error_handler, ErrorSeverity
+from modules.app_state import AppState, StateManager
+from modules.config_loader import get_config_loader
+from modules.thumbnail_cache import get_thumbnail_cache
 from loguru import logger
 
+# Load user configuration (YAML-based, optional)
+_config_loader = get_config_loader()
+_app_config = _config_loader.config
+
 # Tkinter can hit the default limit (1000) when rendering thousands of widgets.
-sys.setrecursionlimit(3000) 
+sys.setrecursionlimit(_app_config.ui.recursion_limit) 
 
 # Configure CustomTkinter
 ctk.set_appearance_mode("System")
@@ -49,8 +61,8 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.var_show_previews = tk.BooleanVar(value=True) # <--- NEW: Preview Toggle
 
         # ThreadPoolExecutor for Thumbnail Generation
-        # Max workers = 4 means only 4 folders get processed at a time.
-        self.thumb_executor = ThreadPoolExecutor(max_workers=4)
+        # Max workers controls how many folders are processed concurrently.
+        self.thumb_executor = ThreadPoolExecutor(max_workers=_app_config.threading.thumbnail_workers)
 
         # Icon
         try:
@@ -69,52 +81,71 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.settings_mgr = SettingsManager()
         self.settings = self.settings_mgr.load()
         self.template_mgr = TemplateManager()
-        
-        # State
-        self.progress_queue = queue.Queue()
-        self.ui_queue = queue.Queue()
-        self.result_queue = queue.Queue()
-        
-        self.cancel_event = threading.Event()
-        self.lock = threading.Lock()
-        
-        # Initialize UploadManager (Modular Logic)
-        self.upload_manager = UploadManager(self.progress_queue, self.result_queue, self.cancel_event)
-        
-        self.file_widgets = {} 
-        self.groups = []       
-        self.results = []
-        self.log_cache = []
-        self.image_refs = []
-        self.log_window_ref = None
-        self.clipboard_buffer = []
-        self.upload_total = 0
-        self.upload_count = 0
-        self.is_uploading = False
-        self.current_output_files = []
-        self.pix_galleries_to_finalize = [] 
-        
-        # Auth
-        self.turbo_cookies = None
-        self.turbo_endpoint = None
-        self.turbo_upload_id = None
-        self.vipr_session = None
-        self.vipr_meta = None
-        self.vipr_galleries_map = {}
+
+        # Centralized State Management (replaces 30+ scattered variables)
+        self.app_state = AppState()
+        self.app_state_mgr = StateManager(self.app_state)
+
+        # Initialize AsyncUploadManager with state queues (performance-optimized)
+        # Uses async/await for better concurrency and lower resource usage
+        self.upload_manager = AsyncUploadManager(
+            self.app_state.queues.progress_queue,
+            self.app_state.queues.result_queue,
+            self.app_state.upload.cancel_event
+        )
+
+        # Initialize UploadCoordinator (business logic layer)
+        self.coordinator = UploadCoordinator(
+            self.app_state,
+            self.upload_manager,
+            self.template_mgr
+        )
+
+        # Backward compatibility aliases (will be gradually removed)
+        # These allow existing code to work while we refactor
+        self.progress_queue = self.app_state.queues.progress_queue
+        self.ui_queue = self.app_state.queues.ui_queue
+        self.result_queue = self.app_state.queues.result_queue
+        self.cancel_event = self.app_state.upload.cancel_event
+        self.lock = self.app_state.lock
+        self.file_widgets = self.app_state.files.file_widgets
+        self.groups = self.app_state.files.groups
+        self.results = self.app_state.results.results
+        self.log_cache = self.app_state.ui.log_cache
+        self.image_refs = self.app_state.files.image_refs
+        self.log_window_ref = self.app_state.ui.log_window_ref
+        self.clipboard_buffer = self.app_state.results.clipboard_buffer
+        self.current_output_files = self.app_state.results.current_output_files
+        self.pix_galleries_to_finalize = self.app_state.results.pix_galleries_to_finalize
+        self.turbo_cookies = self.app_state.auth.turbo_cookies
+        self.turbo_endpoint = self.app_state.auth.turbo_endpoint
+        self.turbo_upload_id = self.app_state.auth.turbo_upload_id
+        self.vipr_session = self.app_state.auth.vipr_session
+        self.vipr_meta = self.app_state.auth.vipr_meta
+        self.vipr_galleries_map = self.app_state.auth.vipr_galleries_map
+        self.upload_total = self.app_state.upload.upload_total
+        self.upload_count = self.app_state.upload.upload_count
+        self.is_uploading = self.app_state.upload.is_uploading
 
         self._load_credentials()
         self._create_menu()
         self._create_layout()
         self._apply_settings()
-        
+        self._setup_coordinator_callbacks()
+
         # DnD
         self.drop_target_register(DND_FILES)
         self.dnd_bind('<<Drop>>', self.drop_files)
-        
-        # CLI
-        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-            self.after(500, lambda: self._process_files([sys.argv[1]]))
-        
+
+        # CLI - Securely validate command line argument
+        if len(sys.argv) > 1:
+            try:
+                validated_path = PathValidator.validate_input_path(sys.argv[1])
+                self.after(500, lambda: self._process_files([str(validated_path)]))
+            except PathValidationError as e:
+                logger.error(f"Invalid CLI argument: {e}")
+                messagebox.showerror("Invalid Path", f"Cannot process path from command line:\n{e}")
+
         self.after(100, self.update_ui_loop)
 
     def _load_credentials(self):
@@ -127,6 +158,58 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
             'vipr_user': keyring.get_password(config.KEYRING_SERVICE_VIPR_USER, "user") or "",
             'vipr_pass': keyring.get_password(config.KEYRING_SERVICE_VIPR_PASS, "pass") or ""
         }
+
+    def _setup_coordinator_callbacks(self):
+        """Set up UI callbacks for the upload coordinator."""
+        self.coordinator.on_upload_start = self._on_upload_start
+        self.coordinator.on_upload_finish = self._on_upload_finish
+        self.coordinator.on_upload_progress = self._on_upload_progress
+        self.coordinator.on_status_update = self._on_status_update
+
+    def _on_upload_start(self):
+        """UI callback when upload starts."""
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.lbl_eta.configure(text="Starting...")
+        self.overall_progress.set(0)
+        try:
+            self.overall_progress.configure(progress_color=["#3B8ED0", "#1F6AA5"])
+        except Exception:
+            self.overall_progress.configure(progress_color="blue")
+
+    def _on_upload_finish(self):
+        """UI callback when upload finishes."""
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.overall_progress.set(1.0)
+        self.overall_progress.configure(progress_color="#34C759")
+
+        # Handle clipboard copy
+        if self.var_auto_copy.get() and self.coordinator.clipboard_buffer:
+            try:
+                full_text = self.coordinator.get_clipboard_text()
+                pyperclip.copy(full_text)
+            except Exception as e:
+                logger.error(f"Failed to copy to clipboard: {e}")
+
+        # Show completion message
+        if self.coordinator.current_output_files:
+            self.btn_open.configure(state="normal")
+            msg = "Output files created."
+            if self.var_auto_copy.get():
+                msg += " All output text copied to clipboard."
+            messagebox.showinfo("Done", msg)
+
+    def _on_upload_progress(self, current: int, total: int):
+        """UI callback for upload progress updates."""
+        if total > 0:
+            self.overall_progress.set(current / total)
+            self.app_state.upload.upload_count = current
+            self.app_state.upload.upload_total = total
+
+    def _on_status_update(self, status: str):
+        """UI callback for status text updates."""
+        self.lbl_eta.configure(text=status)
 
     def _create_menu(self):
         menubar = tk.Menu(self)
@@ -151,8 +234,11 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
             thread_menu.add_radiobutton(label=f"{i} Threads", value=i, variable=self.menu_thread_var, command=lambda n=i: self.set_global_threads(n))
 
         tools_menu.add_separator()
+        tools_menu.add_command(label="Thumbnail Cache Stats", command=self.show_cache_stats)
+        tools_menu.add_command(label="Clear Thumbnail Cache", command=self.clear_cache)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Install Context Menu", command=ContextUtils.install_menu)
-        
+
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Execution Log", command=self.toggle_log)
@@ -571,25 +657,45 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _process_files(self, inputs):
         misc_files = []
         folder_jobs = []
-        
+
         # Capture current state of the checkbox safely on the main thread
         show_previews = self.var_show_previews.get()
 
         for path in inputs:
-            if os.path.isdir(path):
-                folder_name = os.path.basename(path.rstrip(os.sep))
-                group_widget = self._create_group(folder_name)
-                files_in_folder = []
-                for root, _, names in os.walk(path):
-                    for n in names:
-                        if n.lower().endswith(config.SUPPORTED_EXTENSIONS):
-                            files_in_folder.append(os.path.join(root, n))
-                if files_in_folder:
-                    folder_jobs.append((group_widget, sorted(files_in_folder, key=config.natural_sort_key)))
-                else:
-                    group_widget.destroy()
-            elif path.lower().endswith(config.SUPPORTED_EXTENSIONS):
-                misc_files.append(path)
+            try:
+                # Validate path first
+                validated_path = PathValidator.validate_input_path(path)
+                path = str(validated_path)
+
+                if validated_path.is_dir():
+                    folder_name = validated_path.name
+                    group_widget = self._create_group(folder_name)
+
+                    # Use secure directory scanning
+                    try:
+                        files_in_folder = PathValidator.scan_directory_for_images(path, recursive=True)
+                        files_in_folder = [str(f) for f in files_in_folder]
+
+                        if files_in_folder:
+                            folder_jobs.append((group_widget, sorted(files_in_folder, key=config.natural_sort_key)))
+                        else:
+                            group_widget.destroy()
+                    except PathValidationError as e:
+                        logger.error(f"Error scanning directory {path}: {e}")
+                        group_widget.destroy()
+
+                elif validated_path.is_file():
+                    # Validate it's an image file
+                    try:
+                        PathValidator.validate_image_file(path)
+                        misc_files.append(path)
+                    except PathValidationError as e:
+                        logger.warning(f"Skipping invalid file {path}: {e}")
+
+            except PathValidationError as e:
+                logger.warning(f"Skipping invalid path {path}: {e}")
+                messagebox.showwarning("Invalid Path", f"Cannot process path:\n{path}\n\n{e}")
+                continue
         
         # --- FIX 3: Submit jobs to ThreadPoolExecutor instead of spawning threads ---
         for grp, f_list in folder_jobs:
@@ -610,82 +716,84 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         return group
 
     def _thumb_worker(self, files, group_widget, show_previews):
+        """Generate thumbnails with caching for performance."""
+        thumb_cache = get_thumbnail_cache()
+
         for f in files:
             if f in self.file_widgets: continue
-            
+
             pil_image = None
             if show_previews:
-                try:
-                    img = Image.open(f)
-                    img.thumbnail(config.UI_THUMB_SIZE)
-                    pil_image = img
-                except: pil_image = None
-            
+                # Try cache first (fast path)
+                pil_image = thumb_cache.get(f, _app_config.ui.thumbnail_size)
+
+                if pil_image is None:
+                    # Cache miss - generate thumbnail
+                    try:
+                        # Use context manager to ensure file is properly closed
+                        with Image.open(f) as img:
+                            img.thumbnail(_app_config.ui.thumbnail_size)
+                            # Create a copy since original will be closed
+                            pil_image = img.copy()
+
+                        # Store in cache for future use
+                        if pil_image:
+                            thumb_cache.put(f, pil_image, _app_config.ui.thumbnail_size)
+
+                    except Exception as e:
+                        logger.debug(f"Failed to create thumbnail for {f}: {e}")
+                        pil_image = None
+
             self.ui_queue.put(('add', f, pil_image, group_widget))
-            
+
             # If skipping previews, run much faster (shorter sleep)
-            time.sleep(0.01 if show_previews else 0.001)
+            time.sleep(_app_config.performance.thumbnail_sleep_with_preview if show_previews
+                      else _app_config.performance.thumbnail_sleep_no_preview)
 
     # --- Upload Logic ---
     def start_upload(self):
-        # 1. Filter for pending files
-        pending_by_group = {}
-        for grp in self.groups:
-            for fp in grp.files:
-                if self.file_widgets[fp]['state'] == 'pending':
-                    if grp not in pending_by_group: pending_by_group[grp] = []
-                    pending_by_group[grp].append(fp)
-        
-        if not pending_by_group: 
+        """Start the upload process using the coordinator."""
+        # Filter for pending files
+        pending_by_group = self.coordinator.filter_pending_files(self.groups)
+
+        if not pending_by_group:
             messagebox.showinfo("Info", "No pending files found. Please add files or use 'Retry Failed'.")
             return
-        
-        try:
-            cfg = self._gather_settings()
-            
-            # --- FIX: Update global settings so output generation knows which service we used ---
-            self.settings = cfg 
-            # ----------------------------------------------------------------------------------
 
+        try:
+            # Gather and save settings
+            cfg = self._gather_settings()
+            self.settings = cfg  # Update global settings for output generation
             self.settings_mgr.save(cfg)
             cfg['api_key'] = self.creds.get('imx_api', '')
-            
-            self.cancel_event.clear()
-            self.results = []
-            # Reset queue so we don't process old results
-            self.result_queue = queue.Queue()
-            self.upload_manager.result_queue = self.result_queue
-            
-            self.pix_galleries_to_finalize = []
-            self.clipboard_buffer = []
-            
-            self.btn_start.configure(state="disabled")
-            self.btn_stop.configure(state="normal")
-            self.lbl_eta.configure(text="Starting...")
-            
-            self.overall_progress.set(0)
-            try:
-                self.overall_progress.configure(progress_color=["#3B8ED0", "#1F6AA5"]) 
-            except Exception:
-                self.overall_progress.configure(progress_color="blue")
 
-            self.upload_total = sum(len(v) for v in pending_by_group.values())
-            self.upload_count = 0
-            self.is_uploading = True
-            
-            for files in pending_by_group.values():
-                for fp in files: self.file_widgets[fp]['state'] = 'queued'
-
-            # Delegate to the new modular manager
-            self.upload_manager.start_batch(pending_by_group, cfg, self.creds)
+            # Start upload through coordinator (handles all business logic)
+            if self.coordinator.start_upload(pending_by_group, cfg, self.creds):
+                # Update backward compatibility aliases
+                self.is_uploading = self.coordinator.is_uploading
+                self.upload_total = self.coordinator.upload_total
+                self.upload_count = self.coordinator.upload_count
+            else:
+                messagebox.showinfo("Info", "Upload could not be started.")
 
         except Exception as e:
+            logger.error(f"Error starting upload: {e}")
             messagebox.showerror("Error starting upload", str(e))
             self.btn_start.configure(state="normal")
 
     def update_ui_loop(self):
         try:
-            # 1. Process Result Queue (Images finished uploading)
+            # 1. Process Error Notifications (show to user)
+            error_handler = get_error_handler()
+            notification_limit = 3  # Max 3 notifications per cycle to avoid blocking UI
+            shown = 0
+            while shown < notification_limit and error_handler.has_notifications():
+                notification = error_handler.get_notification(block=False)
+                if notification:
+                    self._show_notification(notification)
+                    shown += 1
+
+            # 2. Process Result Queue (Images finished uploading)
             try:
                 while True:
                     fp, img, thumb = self.result_queue.get_nowait()
@@ -693,8 +801,8 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         self.results.append((fp, img, thumb))
             except queue.Empty: pass
 
-            # 2. Process UI Queue (Thumbnails generation)
-            ui_limit = 20
+            # 3. Process UI Queue (Thumbnails generation)
+            ui_limit = _app_config.performance.ui_queue_batch_size
             try:
                 while ui_limit > 0:
                     a, f, p, g = self.ui_queue.get_nowait()
@@ -702,8 +810,8 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     ui_limit -= 1
             except queue.Empty: pass
 
-            # 3. Process Progress Queue (Upload progress status)
-            prog_limit = 50
+            # 4. Process Progress Queue (Upload progress status)
+            prog_limit = _app_config.performance.progress_queue_batch_size
             try:
                 while prog_limit > 0:
                     item = self.progress_queue.get_nowait()
@@ -712,8 +820,8 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     if k == 'register_pix_gal':
                         # New Pixhost Gallery created automatically
                         new_data = item[2]
-                        self.pix_galleries_to_finalize.append(new_data)
-                    
+                        self.coordinator.register_pixhost_gallery(new_data)
+
                     else:
                         f = item[1]
                         v = item[2]
@@ -722,8 +830,11 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
                             if k=='status':
                                 w['status'].configure(text=v)
                                 if v in ['Done', 'Failed']:
-                                    with self.lock:
-                                        self.upload_count += 1
+                                    # Increment through coordinator
+                                    count = self.coordinator.increment_upload_count()
+                                    # Update backward compatibility alias
+                                    self.upload_count = count
+
                                     w['state'] = 'success' if v == 'Done' else 'failed'
                                     w['prog'].set(1.0)
                                     w['prog'].configure(progress_color="#34C759" if v=='Done' else "#FF3B30")
@@ -733,14 +844,15 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     prog_limit -= 1
             except queue.Empty: pass
             
-            if self.is_uploading:
-                with self.lock:
-                    if self.upload_count >= self.upload_total:
-                        self.finish_upload()
+            if self.coordinator.is_uploading:
+                # Check if all uploads are complete
+                current, total = self.coordinator.get_upload_progress()
+                if current >= total:
+                    self.finish_upload()
         except Exception as e:
             print(f"UI Loop Error: {e}")
         finally:
-            self.after(20, self.update_ui_loop)
+            self.after(_app_config.ui.update_interval_ms, self.update_ui_loop)
 
     def _create_row(self, fp, pil_image, group_widget):
         group_widget.add_file(fp)
@@ -748,7 +860,7 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
         row.pack(fill="x", pady=1)
         
         if pil_image:
-            img_widget = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=config.UI_THUMB_SIZE)
+            img_widget = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=_app_config.ui.thumbnail_size)
             l = ctk.CTkLabel(row, image=img_widget, text="")
             l.pack(side="left", padx=5)
             self.image_refs.append(img_widget)
@@ -789,130 +901,119 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
             print(f"Group Update Error: {e}")
 
     def finish_upload(self):
-        if self.pix_galleries_to_finalize:
-            self.lbl_eta.configure(text="Finalizing Galleries...")
-            # We use a temp client here just for finalization
-            client = api.create_resilient_client()
-            for gal in self.pix_galleries_to_finalize:
-                try:
-                    api.finalize_pixhost_gallery(gal.get('gallery_upload_hash'), gal.get('gallery_hash'), client=client)
-                except: pass
-            client.close()
-        
-        self.is_uploading = False
-        self.btn_start.configure(state="normal")
-        self.btn_stop.configure(state="disabled")
-        
-        self.overall_progress.set(1.0) 
-        self.overall_progress.configure(progress_color="#34C759") 
+        """Finish the upload process using the coordinator."""
+        # Delegate to coordinator (handles gallery finalization and cleanup)
+        self.coordinator.finish_upload()
 
-        self.lbl_eta.configure(text="All batches finished.")
-        
-        if self.var_auto_copy.get() and self.clipboard_buffer:
-            try:
-                full_text = "\n\n".join(self.clipboard_buffer)
-                pyperclip.copy(full_text)
-            except Exception: pass
-
-        if self.current_output_files:
-            self.btn_open.configure(state="normal")
-            msg = "Output files created."
-            if self.var_auto_copy.get():
-                msg += " All output text copied to clipboard."
-            messagebox.showinfo("Done", msg)
+        # Update backward compatibility aliases
+        self.is_uploading = self.coordinator.is_uploading
 
     def stop_upload(self):
-        self.cancel_event.set()
-        self.lbl_eta.configure(text="Stopping...")
+        """Stop the current upload process."""
+        self.coordinator.stop_upload()
         self.after(500, self.finish_upload)
 
     def generate_group_output(self, group):
-        res_map = {r[0]: (r[1], r[2]) for r in self.results}
-        group_results = []
-        for fp in group.files:
-            if fp in res_map:
-                group_results.append(res_map[fp])
-        
-        # --- FIX: Log warning if no results found ---
-        if not group_results:
+        """Generate output file for a group using the coordinator."""
+        # Build group context
+        gal_id = getattr(group, 'gallery_id', "")
+        group_context = GroupContext(
+            title=group.title,
+            files=group.files,
+            gallery_id=gal_id
+        )
+
+        # Generate output through coordinator
+        svc = self.settings.get('service', '')
+        out_path = self.coordinator.generate_group_output(
+            group_context,
+            self.var_format.get(),
+            svc,
+            auto_copy=self.var_auto_copy.get()
+        )
+
+        if not out_path:
             self.log(f"Warning: No successful uploads for group '{group.title}'. Output generation skipped.")
-            # Don't show modal warning here, it blocks processing of other groups
             return
 
-        gal_id = getattr(group, 'gallery_id', "")
-        cover_url = group_results[0][1] if group_results else "" 
-
-        gal_link = ""
-        svc = self.settings.get('service', '')
-        if gal_id:
-            if svc == "pixhost.to": gal_link = f"https://pixhost.to/gallery/{gal_id}"
-            elif svc == "imx.to": gal_link = f"https://imx.to/g/{gal_id}"
-            elif svc == "vipr.im": gal_link = f"https://vipr.im/f/{gal_id}"
-
-        ctx = {
-            "gallery_link": gal_link,
-            "gallery_name": group.title,
-            "gallery_id": gal_id,
-            "cover_url": cover_url
-        }
-        
-        text = self.template_mgr.apply(self.var_format.get(), ctx, group_results)
-        
-        # Buffer text first (for final bulk copy)
-        if self.var_auto_copy.get():
-            self.clipboard_buffer.append(text)
-        
-        safe_title = "".join(c for c in group.title if c.isalnum() or c in (' ', '_', '-')).strip()
+        # Update UI
+        safe_title = PathValidator.safe_filename(group.title, max_length=50)
         ts = datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # --- CREATE OUTPUT FOLDER ---
-        output_dir = "Output"
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
-        out_name = os.path.join(output_dir, f"{safe_title}_{ts}.txt")
-        # ----------------------------
-        
-        try:
-            with open(out_name, "w", encoding="utf-8") as f: f.write(text)
-            self.current_output_files.append(out_name)
-            self.log(f"Saved: {out_name}")
-            
-            # --- FIX: Immediate Feedback per Batch ---
-            self.lbl_eta.configure(text=f"Saved: {safe_title}_{ts}.txt")
-            self.btn_open.configure(state="normal") # Enable button immediately
-            
-            # --- FIX: Immediate Clipboard Update (Accumulated) ---
-            if self.var_auto_copy.get():
-                try:
-                    # Update system clipboard immediately with everything generated so far
-                    full_text = "\n\n".join(self.clipboard_buffer)
-                    pyperclip.copy(full_text)
-                except Exception: pass
-            # -----------------------------------------
-            
-            need_links_txt = False
-            if svc == "imx.to" and self.var_imx_links.get(): need_links_txt = True
-            elif svc == "pixhost.to" and self.var_pix_links.get(): need_links_txt = True
-            elif svc == "turboimagehost" and self.var_turbo_links.get(): need_links_txt = True
-            elif svc == "vipr.im" and self.var_vipr_links.get(): need_links_txt = True
-            
-            if need_links_txt:
-                links_name = os.path.join(output_dir, f"{safe_title}_{ts}_links.txt")
+        self.lbl_eta.configure(text=f"Saved: {safe_title}_{ts}.txt")
+        self.btn_open.configure(state="normal")
+
+        # Immediate clipboard update if enabled
+        if self.var_auto_copy.get():
+            try:
+                full_text = self.coordinator.get_clipboard_text()
+                pyperclip.copy(full_text)
+            except Exception as e:
+                logger.error(f"Failed to copy to clipboard: {e}")
+
+        # Log output
+        self.log(f"Saved: {out_path}")
+
+        # Generate links.txt if needed
+        need_links_txt = False
+        if svc == "imx.to" and self.var_imx_links.get(): need_links_txt = True
+        elif svc == "pixhost.to" and self.var_pix_links.get(): need_links_txt = True
+        elif svc == "turboimagehost" and self.var_turbo_links.get(): need_links_txt = True
+        elif svc == "vipr.im" and self.var_vipr_links.get(): need_links_txt = True
+
+        if need_links_txt:
+            try:
+                # Get group results for links
+                res_map = {r[0]: (r[1], r[2]) for r in self.app_state.results.results}
+                group_results = [res_map[fp] for fp in group.files if fp in res_map]
+
+                links_filename = f"{safe_title}_{ts}_links.txt"
+                links_path = PathValidator.validate_output_path(
+                    os.path.join("Output", links_filename),
+                    create_parent=True
+                )
                 raw_links = "\n".join([r[0] for r in group_results])
-                with open(links_name, "w", encoding="utf-8") as f: f.write(raw_links)
-                self.log(f"Saved Links: {links_name}")
-                
-        except Exception as e:
-            self.log(f"Error writing output for {group.title}: {e}")
+                with open(links_path, "w", encoding="utf-8") as f:
+                    f.write(raw_links)
+                self.log(f"Saved Links: {links_path}")
+            except Exception as e:
+                logger.error(f"Failed to create links file: {e}")
 
     def open_output_folder(self):
-        if self.current_output_files:
-             folder = os.path.dirname(os.path.abspath(self.current_output_files[0]))
+        if self.coordinator.current_output_files:
+             folder = os.path.dirname(os.path.abspath(self.coordinator.current_output_files[0]))
              if platform.system() == "Windows": os.startfile(folder)
              else: subprocess.call(["xdg-open", folder])
 
     def toggle_log(self):
         if self.log_window_ref and self.log_window_ref.winfo_exists(): self.log_window_ref.lift()
         else: self.log_window_ref = LogWindow(self, self.log_cache)
+
+    def show_cache_stats(self):
+        """Display thumbnail cache statistics."""
+        cache = get_thumbnail_cache()
+        stats = cache.get_stats()
+
+        msg = (
+            f"Thumbnail Cache Performance:\n\n"
+            f"Hit Rate: {stats['hit_rate_percent']}%\n"
+            f"Cache Hits: {stats['hits']}\n"
+            f"Cache Misses: {stats['misses']}\n"
+            f"Total Requests: {stats['total_requests']}\n\n"
+            f"Memory Cache Size: {stats['memory_cache_size']} / {stats['max_memory_items']} items\n\n"
+            f"Higher hit rates mean better performance.\n"
+            f"Cache automatically evicts oldest items when full (LRU)."
+        )
+
+        messagebox.showinfo("Thumbnail Cache Statistics", msg)
+        cache.log_stats()  # Also log to execution log
+
+    def clear_cache(self):
+        """Clear the thumbnail cache."""
+        if messagebox.askyesno("Clear Cache", "Clear all cached thumbnails?\n\nNext time files are added, thumbnails will be regenerated."):
+            from modules.thumbnail_cache import clear_thumbnail_cache
+            clear_thumbnail_cache()
+            messagebox.showinfo("Success", "Thumbnail cache cleared.")
+            logger.info("Thumbnail cache manually cleared by user")
 
     def retry_failed(self):
         cnt = 0
@@ -926,21 +1027,82 @@ class UploaderApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def clear_list(self):
         self.cancel_event.set()
+
+        # Clear coordinator state
+        self.coordinator.is_uploading = False
+        self.coordinator.upload_count = 0
+        self.coordinator.upload_total = 0
+        self.coordinator.clear_results()
+
+        # Update backward compatibility aliases
         self.is_uploading = False
         self.upload_count = 0
         self.upload_total = 0
-        self.current_output_files = []
-        self.clipboard_buffer = []
+
+        # Track count before clearing for GC decision
+        file_count = len(self.file_widgets)
+
         for grp in self.groups:
             grp.destroy()
         self.groups.clear()
         self.file_widgets.clear()
+
+        # Properly clean up image references to free memory
         self.image_refs.clear()
+
+        # Force garbage collection to free memory immediately for large batches
+        if file_count > 100:
+            gc.collect()
+            logger.info(f"Garbage collection triggered after clearing {file_count} files")
+
         self.overall_progress.set(0)
         self.lbl_eta.configure(text="Cleared.")
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-    
+
+    def _show_notification(self, notification):
+        """
+        Display a notification to the user based on severity.
+
+        Args:
+            notification: UserNotification object from error handler
+        """
+        try:
+            # Determine icon type based on severity
+            if notification.severity == ErrorSeverity.CRITICAL:
+                icon = messagebox.ERROR
+            elif notification.severity == ErrorSeverity.ERROR:
+                icon = messagebox.ERROR
+            elif notification.severity == ErrorSeverity.WARNING:
+                icon = messagebox.WARNING
+            else:
+                icon = messagebox.INFO
+
+            # Create message with optional details
+            message = notification.message
+            if notification.show_details_button and notification.details:
+                # Truncate long details for display
+                details_preview = notification.details[:200]
+                if len(notification.details) > 200:
+                    details_preview += "..."
+                message += f"\n\nDetails:\n{details_preview}"
+
+            # Show notification (non-blocking)
+            if icon == messagebox.ERROR:
+                messagebox.showerror(notification.title, message, parent=self)
+            elif icon == messagebox.WARNING:
+                messagebox.showwarning(notification.title, message, parent=self)
+            else:
+                messagebox.showinfo(notification.title, message, parent=self)
+
+            # Log to execution log as well
+            self.log(f"[{notification.severity.value.upper()}] {notification.title}: {notification.message}")
+
+        except Exception as e:
+            # Fallback if notification display fails
+            logger.error(f"Failed to show notification: {e}")
+            self.log(f"Error: {notification.title} - {notification.message}")
+
     def log(self, msg):
         config.logger.info(msg)
         if self.log_window_ref and self.log_window_ref.winfo_exists():

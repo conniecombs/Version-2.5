@@ -8,6 +8,38 @@ import os
 APP_VERSION = "2.1.0"
 USER_AGENT = f"ConniesUploader/{APP_VERSION}"
 
+# --- UI Configuration ---
+# Tkinter can hit recursion limit when rendering thousands of widgets
+# This value allows ~1000 file entries without stack overflow
+RECURSION_LIMIT = 3000
+
+# UI update intervals (milliseconds)
+UI_UPDATE_INTERVAL_MS = 20  # Balance between responsiveness and CPU usage
+
+# Queue batch processing limits
+UI_QUEUE_BATCH_SIZE = 20      # Max UI updates per cycle
+PROGRESS_QUEUE_BATCH_SIZE = 50  # Max progress updates per cycle
+RESULT_QUEUE_BATCH_SIZE = 10   # Max result processing per cycle
+
+# Thumbnail generation
+THUMBNAIL_WORKER_THREADS = 4    # Max parallel thumbnail generation threads
+THUMBNAIL_SLEEP_WITH_PREVIEW = 0.01   # Delay between thumbnails (with preview)
+THUMBNAIL_SLEEP_NO_PREVIEW = 0.001    # Delay between thumbnails (no preview)
+
+# --- Threading Configuration ---
+DEFAULT_THREAD_LIMITS = {
+    'imx': 5,        # IMX.to can handle more concurrent uploads
+    'pixhost': 3,    # Pixhost is more rate-limited
+    'turbo': 2,      # Turbo is conservative
+    'vipr': 1        # Vipr is strictest, single-threaded recommended
+}
+
+# --- Network Configuration ---
+HTTP_TIMEOUT_SECONDS = 60.0    # Default timeout for HTTP requests
+HTTP_RETRY_COUNT = 3           # Number of retries for failed requests
+UPLOAD_TIMEOUT_SECONDS = 300   # Extended timeout for large file uploads
+UPLOAD_CHUNK_SIZE = 8192       # Bytes to read per chunk during upload
+
 # --- Constants ---
 IMX_URL = "https://api.imx.to/v1/upload.php"
 PIX_URL = "https://api.pixhost.to/images"

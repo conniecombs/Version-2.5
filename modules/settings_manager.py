@@ -1,6 +1,7 @@
 # settings_manager.py
 import json
 import os
+from loguru import logger
 from . import config
 
 class SettingsManager:
@@ -45,4 +46,4 @@ class SettingsManager:
             with open(self.filepath, 'w') as f:
                 json.dump(data, f, indent=4)
         except Exception as e:
-            print(f"Failed to save settings: {e}")
+            logger.error(f"Failed to save settings: {e}")

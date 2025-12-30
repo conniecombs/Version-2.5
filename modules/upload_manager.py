@@ -4,10 +4,16 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from . import api
 from . import config
+from .config_loader import get_config_loader
+from .error_handler import handle_upload_error, ErrorContext, ErrorSeverity, get_error_handler, handle_network_error
+from .retry_utils import retry_on_network_error, RetryConfig, is_retryable_error
 from loguru import logger
 
 # Thread-local storage for HTTP clients (replaces the global one in main.py)
 thread_local_data = threading.local()
+
+# Load application configuration
+_app_config = get_config_loader().config
 
 def get_thread_client():
     if not hasattr(thread_local_data, "client"):
@@ -131,21 +137,46 @@ class UploadManager:
                 th = "800x800" if (is_first and cfg.get('vipr_cover')) else cfg['vipr_thumb']
                 uploader = api.ViprUploader(fp, cb, cfg.get('vipr_meta', {}).get('upload_url', config.VIPR_HOME_URL), "", th, cfg['vipr_gal_id'], client=client)
 
-            # Execute Upload
+            # Execute Upload with retry logic
             if uploader:
                 url, data, headers = uploader.get_request_params()
-                
+
                 def read_monitor_chunks(monitor):
                     while True:
-                        chunk = monitor.read(8192)
+                        chunk = monitor.read(_app_config.network.chunk_size)
                         if not chunk: break
                         yield chunk
-                
+
                 if 'Content-Length' not in headers and hasattr(data, 'len'):
                     headers['Content-Length'] = str(data.len)
 
-                r = client.post(url, headers=headers, content=read_monitor_chunks(data), timeout=300)
-                
+                # Wrap upload in retry decorator with custom config
+                retry_config = RetryConfig(
+                    max_attempts=_app_config.network.retry_count,
+                    base_delay=2.0,  # Start with 2 second delay
+                    max_delay=30.0,  # Cap at 30 seconds
+                    exponential_base=2.0  # Double the delay each retry
+                )
+
+                @retry_on_network_error(retry_config)
+                def _perform_upload():
+                    """Upload with automatic retry on network errors"""
+                    self.progress_queue.put(('status', fp, 'Uploading'))
+                    return client.post(
+                        url,
+                        headers=headers,
+                        content=read_monitor_chunks(data),
+                        timeout=_app_config.network.upload_timeout_seconds
+                    )
+
+                try:
+                    r = _perform_upload()
+                except Exception as retry_error:
+                    # If retries exhausted, check if it was network error
+                    if is_retryable_error(retry_error):
+                        handle_network_error(retry_error, "Upload", service)
+                    raise
+
                 resp = r.text if service == 'vipr.im' else r.json()
                 img, thumb = uploader.parse_response(resp)
                 
@@ -155,6 +186,11 @@ class UploadManager:
                 
         except Exception as e:
             self.progress_queue.put(('status', fp, 'Failed'))
-            logger.error(f"Err {os.path.basename(fp)}: {e}")
+            # Use centralized error handler
+            handle_upload_error(
+                error=e,
+                file_path=fp,
+                service=cfg.get('service', 'unknown')
+            )
         finally:
             if uploader: uploader.close()
